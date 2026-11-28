@@ -27,6 +27,7 @@ const Probe = struct {
         players: *Players,
         entities: *vanilla.Entities,
         mobs: *vanilla.Mobs,
+        cow: *vanilla.Cow,
         dropped: *vanilla.ItemEntities,
         experience: *vanilla.Experience,
         projectiles: *vanilla.Projectiles,
@@ -70,7 +71,7 @@ const Probe = struct {
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready) return error.EntityRestartPlayerNotReady;
         const world = player.world;
-        const cow = try self.deps.mobs.spawn(.{ .species = .cow, .world = world, .position = .{ 4.5, 65, 4.5 }, .yaw = 0 });
+        const cow = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = world, .position = .{ 4.5, 65, 4.5 }, .yaw = 0 });
         const mob = (try self.deps.mobs.get(cow)).?;
         mob.living.health = cow_health;
         self.expected.cow = mob.entity.uuid;

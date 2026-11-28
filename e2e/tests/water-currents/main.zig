@@ -28,6 +28,7 @@ const Scene = struct {
         worlds: *vanilla.VanillaWorlds,
         players: *Players,
         mobs: *vanilla.Mobs,
+        cow: *vanilla.Cow,
         dropped: *vanilla.ItemEntities,
         items: *vanilla.Items,
     };
@@ -53,7 +54,7 @@ const Scene = struct {
         if (!ready) return;
         self.placed = true;
         const world = self.deps.worlds.overworld;
-        _ = try self.deps.mobs.spawn(.{ .species = .cow, .world = world, .position = .{ 6.5, 64, 8.5 }, .yaw = -90 });
+        _ = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = world, .position = .{ 6.5, 64, 8.5 }, .yaw = -90 });
         _ = try self.deps.dropped.create(world, .{ 5.5, 64.5, 8.5 }, .{ 0, 0, 0 }, .{ .item = try self.deps.items.define("minecraft:stone"), .count = 1 });
     }
 };

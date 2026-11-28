@@ -113,6 +113,8 @@ pub const Fluids = @import("vanilla_blocks").fluids.Fluids;
 pub const Buckets = @import("vanilla_blocks").buckets.Buckets;
 pub const ToolActions = @import("vanilla_blocks").tool_actions.ToolActions;
 pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
+pub const Cow = @import("vanilla_cow").Cow;
+pub const Sheep = @import("vanilla_sheep").Sheep;
 pub const mob_goals = @import("vanilla_mobs").goals;
 pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplication;
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;
@@ -238,6 +240,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ToolActions, .{}),
     lightning_rod.plugin.configured(RandomTicks, RandomTicks.Configuration{}),
     lightning_rod.plugin.configured(Mobs, Mobs.Configuration{}),
+    lightning_rod.plugin.configured(Cow, .{}),
+    lightning_rod.plugin.configured(Sheep, .{}),
     lightning_rod.plugin.configured(Boats, .{}),
     lightning_rod.plugin.configured(BoatItems, .{}),
     lightning_rod.plugin.configured(SpawnEggs, SpawnEggs.Configuration{}),

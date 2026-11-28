@@ -1,7 +1,7 @@
 //! Players acting on mobs and each other, from ServerboundInteractPacket as
 //! ServerGamePacketListenerImpl handles it: attacks go to Melee, and uses through Mob.interact,
-//! where cows are milked with buckets, fed their food to fall in love or grow, and given spawn
-//! eggs for calves.
+//! where a mob's species acts first, as a cow gives milk, then animals are fed their food to fall
+//! in love or grow, and given spawn eggs for young, and last an item may act on the mob.
 
 const std = @import("std");
 const game_data = @import("game_data");
@@ -18,6 +18,7 @@ const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 const Items = @import("vanilla_items").items.Items;
+const Durability = @import("vanilla_items").item_properties.Durability;
 const world_effects = @import("vanilla_blocks").world_effects;
 const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
@@ -48,13 +49,15 @@ pub const MobInteraction = struct {
         menus: *PlayerInventory,
         attributes: *EquipmentAttributes,
         melee: *Melee,
+        durability: *Durability,
     };
 
     deps: Dependencies,
     effects: world_effects.Effects,
     sound_seeds: std.Random.DefaultPrng,
-    bucket: u32,
-    milk_bucket: u32,
+    /// The random tools wear by, as the level's would draw for unbreaking.
+    random: std.Random.DefaultPrng,
+    scratch: std.heap.FixedBufferAllocator,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*MobInteraction {
         const self = try allocator.create(MobInteraction);
@@ -62,8 +65,8 @@ pub const MobInteraction = struct {
             .deps = deps,
             .effects = try .init(allocator, deps.players),
             .sound_seeds = .init(0x696e7465726163),
-            .bucket = @intCast(registry.itemId("minecraft:bucket").?),
-            .milk_bucket = @intCast(registry.itemId("minecraft:milk_bucket").?),
+            .random = .init(0x7368656172),
+            .scratch = .init(try allocator.alloc(u8, 16 * 1024)),
         };
         try deps.input.on(.use_entity, self, .{ onUse, onUseModern });
         inline for (protocols.implementations) |Version| {
@@ -72,7 +75,7 @@ pub const MobInteraction = struct {
         return self;
     }
 
-    const Hand = enum { main, off };
+    pub const Hand = enum { main, off };
 
     fn heldSlot(self: *MobInteraction, slot: usize, hand: Hand) inventories.Slot {
         const player = &self.deps.players.records[slot];
@@ -220,14 +223,12 @@ pub const MobInteraction = struct {
                 return;
             }
         }
-        // AbstractCow.mobInteract: a bucket fills with milk from a grown cow.
-        if (kind == self.bucket and !mob.baby()) {
-            self.playerSound(slot, "minecraft:entity.cow.milk");
-            try self.exchange(slot, hand, self.milk_bucket);
-            return;
-        }
+        const hooks = self.deps.mobs.traits(mob.entity.species).definition.hooks;
+        const use: Use = .{ .interaction = self, .slot = slot, .hand = hand, .mob = mob, .held = held, .kind = kind };
+        // Mob.mobInteract as the species overrides it, before Animal's.
+        if (hooks.interact) |interact_hook| if (try interact_hook(hooks.context, &use)) return;
         // Animal.mobInteract.
-        if (try self.deps.mobs.isFood(held)) {
+        if (try self.deps.mobs.isFood(held, mob.entity.species)) {
             if (mob.idle.age == 0 and mob.inLove() <= 0) {
                 try self.usePlayerItem(slot, hand);
                 try self.deps.mobs.setInLove(mob, player.uuid);
@@ -239,6 +240,24 @@ pub const MobInteraction = struct {
                 return;
             }
         }
+        // Player.interactOn: the mob passed the use on, so the item may act on it, as a dye on a
+        // sheep.
+        if (hooks.use_item) |use_item| _ = try use_item(hooks.context, &use);
+    }
+
+    /// ItemStack.hurtAndBreak by one, for the tool in a hand, but in creative.
+    pub fn wearHeld(self: *MobInteraction, slot: usize, hand: Hand) !void {
+        const player = &self.deps.players.records[slot];
+        if (self.deps.player_states.of(player).gamemode == .creative) return;
+        const held_slot = self.heldSlot(slot, hand);
+        const held = try self.deps.inventories.get(held_slot);
+        const stack = held.stack orelse return;
+        self.scratch.reset();
+        const worn = try self.deps.durability.wear(stack, .{ .amount = 1, .slot = if (hand == .off) 1 else 0, .actor = player, .random = self.random.random(), .scratch = &self.scratch });
+        if (std.meta.eql(worn, held.stack)) return;
+        const committed = try self.deps.inventories.set(held_slot, held.revision, worn);
+        assert(committed);
+        self.deps.menus.changed(slot);
     }
 
     /// AgeableMob.getSpeedUpSecondsWhenFeeding.
@@ -249,13 +268,13 @@ pub const MobInteraction = struct {
     /// SpawnEggItem.spawnOffspringFromSpawnEgg for a mob that can be a baby.
     fn offspringFromEgg(self: *MobInteraction, slot: usize, mob: Mob, hand: Hand) !void {
         const mobs = self.deps.mobs;
-        _ = try mobs.spawn(.{ .species = mob.entity.species, .world = mob.motion.world, .position = mob.motion.position, .yaw = 0, .baby = true, .variant = mob.cow.variant, .finalize = false });
+        _ = try mobs.spawnOffspring(mob, mob);
         try self.usePlayerItem(slot, hand);
     }
 
     /// Animal.usePlayerItem: one of the held stack is used up, but by players with infinite
     /// materials.
-    fn usePlayerItem(self: *MobInteraction, slot: usize, hand: Hand) !void {
+    pub fn usePlayerItem(self: *MobInteraction, slot: usize, hand: Hand) !void {
         const player = &self.deps.players.records[slot];
         if (self.deps.player_states.of(player).gamemode == .creative) return;
         const held_slot = self.heldSlot(slot, hand);
@@ -268,7 +287,7 @@ pub const MobInteraction = struct {
 
     /// ItemUtils.createFilledResult: one of the held stack becomes the output, which in creative
     /// is added only if the inventory has none.
-    fn exchange(self: *MobInteraction, slot: usize, hand: Hand, output: u32) !void {
+    pub fn exchange(self: *MobInteraction, slot: usize, hand: Hand, output: u32) !void {
         const player = &self.deps.players.records[slot];
         const name = registry.item_names[output];
         if (self.deps.player_states.of(player).gamemode == .creative) {
@@ -292,9 +311,27 @@ pub const MobInteraction = struct {
     }
 
     /// Player.playSound: where the player is, for everyone but them.
-    fn playerSound(self: *MobInteraction, slot: usize, name: []const u8) void {
+    pub fn playerSound(self: *MobInteraction, slot: usize, name: []const u8) void {
         const player = &self.deps.players.records[slot];
         self.effects.sound(player.world, player.position, name, .players, 1, 1, @bitCast(self.sound_seeds.next()), slot);
+    }
+};
+
+/// A player using what is in a hand on a mob, as a species' hooks see it, with what they may do.
+pub const Use = struct {
+    interaction: *MobInteraction,
+    slot: usize,
+    hand: MobInteraction.Hand,
+    mob: Mob,
+    held: inventories.Stack,
+    /// The held item's kind.
+    kind: u32,
+
+    /// Sounds from where the mob is, for everyone but the player, whose client plays them.
+    pub fn sound(self: *const Use, name: []const u8) void {
+        const at = self.mob.motion.position;
+        const interaction = self.interaction;
+        interaction.effects.sound(self.mob.motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, name, .players, 1, 1, @bitCast(interaction.sound_seeds.next()), self.slot);
     }
 };
 

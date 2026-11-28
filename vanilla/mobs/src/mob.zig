@@ -1,6 +1,6 @@
 //! A mob's state, by the components of vanilla's classes: what Entity, LivingEntity, Mob,
-//! PathfinderMob, AgeableMob and Animal keep, and the cow's variant. Plain data, each part a
-//! component of its own.
+//! PathfinderMob, AgeableMob and Animal keep, and a few bytes each species keeps of its own.
+//! Plain data, each part a component of its own.
 
 const std = @import("std");
 const extras = @import("extras.zig");
@@ -8,8 +8,11 @@ const body = @import("vanilla_bodies").body;
 const mob_blocks = @import("vanilla_bodies").mob_blocks;
 const JavaRandom = @import("vanilla_bodies").java_random.JavaRandom;
 
-/// Mob types this server simulates.
-pub const Species = enum(u8) { cow };
+/// A species registered with the Mobs plugin, by the order they were registered in.
+pub const Species = enum(u8) { _ };
+
+/// How many species may register.
+pub const max_species = 16;
 
 /// One stretch of movement in a tick, which block effects trace (Entity.Movement).
 pub const Movement = @import("vanilla_bodies").block_effects.Movement;
@@ -67,7 +70,7 @@ pub const Goals = struct {
     /// GoalSelector.disabledFlags, set every fifth tick from passengers.
     disabled: u4 = 0,
     /// The goal holding the jump flag, by priority, or none.
-    jump_owner: ?u3 = null,
+    jump_owner: ?u4 = null,
 };
 
 /// Breeding, tempting and looking at a player take the look flag, as looking around does, so no
@@ -105,12 +108,11 @@ pub const Idle = struct {
     tempt_calm_down: i32 = 0,
     /// AgeableMob.age: below zero a baby, above it a breeding cooldown.
     age: i32 = 0,
-    /// Bits of running goals, by priority: float, panic, breed, tempt, follow parent, stroll,
-    /// look at player, look around.
-    running: u8 = 0,
+    /// Bits of running goals, by their priority among its species' goals.
+    running: u16 = 0,
     /// Goals holding the move and look flags, by priority, or none.
-    move_owner: ?u3 = null,
-    look_owner: ?u3 = null,
+    move_owner: ?u4 = null,
+    look_owner: ?u4 = null,
     /// RandomLookAroundGoal's direction and time, while it runs.
     look_around: struct { relative: [2]f64 = .{ 0, 0 }, time: i32 = 0 } = .{},
 };
@@ -254,14 +256,15 @@ pub const Extras = union(enum) {
     copy: *Rare,
 };
 
-/// Cow: its variant.
-pub const CowPart = struct {
-    variant: u8 = 0,
+/// What a species' plugin keeps of each of its mobs, as its own class keeps it: the cow's
+/// variant, the sheep's wool. The plugin reads its bytes as it likes, saved as they are.
+pub const Kin = struct {
+    bytes: [4]u8 = @splat(0),
 };
 
 /// A mob's components as values, grouped by what reads and writes them together: what an idle
 /// tick changes, where it is and moves, then by vanilla's classes, Entity, LivingEntity, Mob with
-/// its GoalSelector, PathfinderMob's navigation, AgeableMob and Animal, and the cow's own. What a
+/// its GoalSelector, PathfinderMob's navigation, AgeableMob and Animal, and its species' kin. What a
 /// mob is made from, saved as, and copied into for checks; the mobs' table keeps each a column.
 pub const MobState = struct {
     idle: Idle,
@@ -271,7 +274,7 @@ pub const MobState = struct {
     control: Control = .{},
     goals: Goals = .{},
     navigation: Navigation = .{},
-    cow: CowPart = .{},
+    kin: Kin = .{},
     rare: Rare = .{},
 };
 
@@ -285,11 +288,11 @@ pub const Mob = struct {
     control: *Control,
     goals: *Goals,
     navigation: *Navigation,
-    cow: *CowPart,
+    kin: *Kin,
     extras: Extras,
 
     /// The groups every mob has, which a handle reaches directly.
-    pub const groups = .{ "idle", "motion", "entity", "living", "control", "goals", "navigation", "cow" };
+    pub const groups = .{ "idle", "motion", "entity", "living", "control", "goals", "navigation", "kin" };
 
     /// A handle over values held elsewhere, as a copy is.
     pub fn of(values: *MobState) Mob {

@@ -11,7 +11,6 @@ const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInve
 const mth = @import("vanilla_bodies").mth;
 const body = @import("vanilla_bodies").body;
 const mob_state = @import("mob.zig");
-const mob_replication = @import("mob_replication.zig");
 const Mobs = @import("mobs.zig").Mobs;
 
 const assert = std.debug.assert;
@@ -36,16 +35,15 @@ pub const SpawnEggs = struct {
         return self;
     }
 
-    fn speciesOf(item: u32) ?mob_state.Species {
+    /// The species a spawn egg makes, if one registered.
+    fn speciesOf(self: *const SpawnEggs, item: u32) ?mob_state.Species {
         const entity = game_data.physics.spawnEgg(@intCast(item)) orelse return null;
-        const name = game_data.registry.entityName(@intCast(entity)) orelse return null;
-        if (std.mem.eql(u8, name, "minecraft:cow")) return .cow;
-        return null;
+        return self.deps.mobs.speciesOfType(@intCast(entity));
     }
 
     fn use(self: *SpawnEggs, context: *const item_actions.Context) !item_actions.Result {
         const hit = context.hit orelse return .pass;
-        const species = speciesOf(context.item.kind) orelse return .pass;
+        const species = self.speciesOf(context.item.kind) orelse return .pass;
         const player = context.player;
         const mobs = self.deps.mobs;
         const level = mobs.level(player.world);
@@ -65,7 +63,6 @@ pub const SpawnEggs = struct {
             .world = player.world,
             .position = .{ x, @as(f64, @floatFromInt(position[1])) + y_offset, z },
             .yaw = yaw,
-            .variant = mob_replication.default_variant,
         });
         // EntityType.create and EntityType.spawn each play the ambient sound.
         const mob = (try mobs.get(entity)).?;

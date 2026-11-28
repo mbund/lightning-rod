@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const mob_state = @import("mob.zig");
+const species_data = @import("species.zig");
 const JavaRandom = @import("vanilla_bodies").java_random.JavaRandom;
 const ai = @import("ai.zig");
 const mth = @import("vanilla_bodies").mth;
@@ -18,10 +19,13 @@ const Mob = mob_state.Mob;
 const Idle = mob_state.Idle;
 const Motion = mob_state.Motion;
 const assert = std.debug.assert;
+const species_count = mob_state.max_species;
 
-/// RandomLookAroundGoal, last of the cow's goals.
-const look_around_priority = 7;
-const look_around_bit: u8 = 1 << look_around_priority;
+/// RandomLookAroundGoal, last of the animal goals, which every species that idles registers.
+const look_around_priority: u4 = for (species_data.animal_goals, 0..) |goal, at| {
+    if (std.meta.eql(goal, species_data.Goal{ .shared = .look_around })) break at;
+} else unreachable;
+const look_around_bit: u16 = @as(u16, 1) << look_around_priority;
 
 /// Whether a resting mob's tick is only counters, draws and turning: no goal but the look
 /// around runs, nothing hurts, and the look control's pitch stays level.
@@ -34,7 +38,7 @@ pub fn idle(mobs: *const Mobs, mob: Mob) bool {
     assert(mob.part(.focus) == null);
     // While the look control counts down, the pitch it turns toward must keep the head level.
     if (hot.look_cooldown > 0) if (ai.lookPitch(mobs, mob)) |pitch| if (mth.rotateTowards(0, pitch, hot.look_max_pitch) != 0) return false;
-    return mob.motion.resting and mob.alive() and !mob.control.no_ai and !mob.entity.first_tick and mob.entity.species == .cow and
+    return mob.motion.resting and mob.alive() and !mob.control.no_ai and !mob.entity.first_tick and mobs.traits(mob.entity.species).definition.idles and
         mob.goals.jump_owner == null and mob.goals.disabled == 0 and
         !mob.navigation.path.active and !mob.navigation.has_delayed_recomputation and
         mob.motion.pitch == 0 and mob.motion.old_pitch == 0 and mob.motion.yaw == mob.motion.old_yaw and
@@ -54,8 +58,8 @@ pub fn gazeYaw(mob: Mob) f32 {
 pub const Audience = struct {
     /// Players Mobs.nearestPlayerDistanceSquared counts: ready and not spectating.
     present: []const Player,
-    /// Of those, the ones holding the mobs' food, which may tempt them.
-    holding_food: []const Player,
+    /// Of those, by species, the ones holding its food, which may tempt it.
+    holding_food: [species_count][]const Player,
 
     pub const Player = struct { world: u32, position: [3]f64 };
 
@@ -86,8 +90,8 @@ pub const Audience = struct {
 
     /// Whether a holder is close enough that TemptGoal must look properly: within its 10
     /// blocks, before sneaking narrows that.
-    pub fn temptsNear(self: Audience, world: u32, position: [3]f64, range: f64) bool {
-        for (self.holding_food) |player| {
+    pub fn temptsNear(self: Audience, species: mob_state.Species, world: u32, position: [3]f64, range: f64) bool {
+        for (self.holding_food[@backingInt(species)]) |player| {
             if (player.world != world) continue;
             const dx = position[0] - player.position[0];
             const dy = position[1] - player.position[1];
@@ -98,8 +102,9 @@ pub const Audience = struct {
     }
 };
 
-/// What an idle tick needs of the species, all cows here.
+/// What an idle tick needs of the species.
 pub const Species = struct {
+    which: mob_state.Species,
     tempt_range: f64,
     eye_height: f32,
     ambient_interval: i32,
@@ -167,7 +172,7 @@ pub fn advance(hot: *Idle, still: Still, gaze_yaw: *f32, audience: Audience, spe
         if (gazing and !(look_around_time >= 0)) gazing = false;
         if (calm_down > 0) {
             calm_down -= 1;
-        } else if (audience.temptsNear(world, position, species.tempt_range)) {
+        } else if (audience.temptsNear(species.which, world, position, species.tempt_range)) {
             return .started;
         }
         if (no_action < 100 and random.nextIntBounded(60) == 0) return .started;
@@ -346,7 +351,7 @@ pub fn advanceBlock(run: Run, audience: Audience, species: Species) Block {
     var ambient = gather(i32, hot, "ambient_sound_time");
     var no_action = gather(i32, hot, "no_action_time");
     var calm_down = gather(i32, hot, "tempt_calm_down");
-    var gazing: Mask = gather(u8, hot, "running") == @as(@Vector(lane_count, u8), @splat(look_around_bit));
+    var gazing: Mask = gather(u16, hot, "running") == @as(@Vector(lane_count, u16), @splat(look_around_bit));
     var look_around_time: I32 = undefined;
     inline for (0..lane_count) |lane| look_around_time[lane] = hot[lane].look_around.time;
     var cooldown = gather(i32, hot, "look_cooldown");
@@ -395,9 +400,9 @@ pub fn advanceBlock(run: Run, audience: Audience, species: Species) Block {
     gazing = gazing & !(full & (look_around_time < zero));
     const calming = full & (calm_down > zero);
     calm_down = @select(i32, calming, calm_down -% @as(I32, @splat(1)), calm_down);
-    if (audience.holding_food.len > 0) {
+    if (audience.holding_food[@backingInt(species.which)].len > 0) {
         inline for (0..lane_count) |lane| {
-            if (full[lane] and !calming[lane] and audience.temptsNear(worlds[lane], positions[lane], species.tempt_range)) rare[lane] = true;
+            if (full[lane] and !calming[lane] and audience.temptsNear(species.which, worlds[lane], positions[lane], species.tempt_range)) rare[lane] = true;
         }
     }
     const strolling = full & (no_action < @as(I32, @splat(100)));

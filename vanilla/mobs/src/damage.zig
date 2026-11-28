@@ -51,12 +51,12 @@ pub fn hurt(mobs: *Mobs, mob: Mob, damage: mob_state.Damage, amount: f32) !bool 
         }
     }
     if (!mob.alive()) {
-        if (full) mobs.makeSound(mob, deathSound(mob));
+        if (full) mobs.makeSound(mob, deathSound(mobs, mob));
         try die(mobs, mob, damage);
     } else if (full) {
         // Mob.playHurtSound resets the ambient sound's wait first.
         mob.idle.ambient_sound_time = -mobs.traits(mob.entity.species).ambient_interval;
-        mobs.makeSound(mob, hurtSound(mob));
+        mobs.makeSound(mob, hurtSound(mobs, mob));
     }
     _ = try mob.put(.hurt, .{ .damage = damage, .stamp = mobs.gameTime() });
     return true;
@@ -85,14 +85,10 @@ fn die(mobs: *Mobs, mob: Mob, damage: mob_state.Damage) !void {
     mobs.entityEvent(mob, 3);
 }
 
-fn hurtSound(mob: Mob) @import("mobs.zig").Sound {
-    return switch (mob.entity.species) {
-        .cow => .cow_hurt,
-    };
+fn hurtSound(mobs: *const Mobs, mob: Mob) []const u8 {
+    return mobs.traits(mob.entity.species).definition.sounds.hurt;
 }
 
-fn deathSound(mob: Mob) @import("mobs.zig").Sound {
-    return switch (mob.entity.species) {
-        .cow => .cow_death,
-    };
+fn deathSound(mobs: *const Mobs, mob: Mob) []const u8 {
+    return mobs.traits(mob.entity.species).definition.sounds.death;
 }

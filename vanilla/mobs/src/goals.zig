@@ -1,6 +1,8 @@
-//! GoalSelector with the cow's goals, in AbstractCow.registerGoals' order: float, panic, breed,
-//! tempt, follow parent, stroll, look at a player, look around. A goal holds the move, look and
-//! jump flags it uses, and starts when every one is free or held by a goal of a lower priority.
+//! GoalSelector over the goals each species registers, in its registerGoals' order, which is
+//! their priority: the animal goals every species may share, float, panic, breed, tempt, follow
+//! parent, stroll, look at a player and look around, run here, and a species' own goals run by
+//! its plugin. A goal holds the move, look and jump flags it uses, and starts when every one is
+//! free or held by a goal of a lower priority.
 
 const std = @import("std");
 const game_data = @import("game_data");
@@ -14,82 +16,57 @@ const pathfinding = @import("pathfinding.zig");
 const senses = @import("senses.zig");
 const random_positions = @import("random_positions.zig");
 const mob_state = @import("mob.zig");
+const species_data = @import("species.zig");
 const Mobs = @import("mobs.zig").Mobs;
 
 const Mob = mob_state.Mob;
+const Goal = species_data.Goal;
+const Shared = species_data.Shared;
 
-pub const Goal = enum(u3) {
-    float,
-    panic,
-    breed,
-    tempt,
-    follow_parent,
-    stroll,
-    look_at_player,
-    look_around,
-
-    const Flags = packed struct { move: bool = false, look: bool = false, jump: bool = false };
-
-    fn flags(self: Goal) Flags {
-        return switch (self) {
-            .float => .{ .jump = true },
-            .panic, .stroll => .{ .move = true },
-            .breed, .tempt, .look_around => .{ .move = true, .look = true },
-            .follow_parent => .{},
-            .look_at_player => .{ .look = true },
-        };
-    }
-
-    fn requiresUpdateEveryTick(self: Goal) bool {
-        return self == .float or self == .look_around;
-    }
-
-    fn priority(self: Goal) u3 {
-        return @backingInt(self);
-    }
-};
-
-const all = [_]Goal{ .float, .panic, .breed, .tempt, .follow_parent, .stroll, .look_at_player, .look_around };
-
-fn running(mob: Mob, goal: Goal) bool {
-    return mob.idle.running & bit(goal) != 0;
+fn requiresUpdateEveryTick(goal: Goal) bool {
+    return species_data.everyTick(goal);
 }
 
-fn bit(goal: Goal) u8 {
-    return @as(u8, 1) << @backingInt(goal);
+fn goalsOf(mobs: *const Mobs, mob: Mob) []const Goal {
+    return mobs.traits(mob.entity.species).definition.goals;
 }
 
-pub fn isPanicking(mob: Mob) bool {
-    return running(mob, .panic);
+fn running(mob: Mob, priority: u4) bool {
+    return mob.idle.running & (@as(u16, 1) << priority) != 0;
+}
+
+/// Whether the mob runs its PanicGoal.
+pub fn isPanicking(mobs: *const Mobs, mob: Mob) bool {
+    return mob.idle.running & mobs.traits(mob.entity.species).sharedBit(.panic) != 0;
 }
 
 /// WrappedGoal.stop.
-fn stopGoal(mobs: *Mobs, mob: Mob, goal: Goal) void {
-    if (!running(mob, goal)) return;
-    mob.idle.running &= ~bit(goal);
-    stop(mobs, mob, goal);
+fn stopGoal(mobs: *Mobs, mob: Mob, priority: u4) void {
+    if (!running(mob, priority)) return;
+    mob.idle.running &= ~(@as(u16, 1) << priority);
+    stop(mobs, mob, goalsOf(mobs, mob)[priority]);
 }
 
 /// WrappedGoal.start.
-fn startGoal(mobs: *Mobs, mob: Mob, goal: Goal) !void {
-    if (running(mob, goal)) return;
-    mob.idle.running |= bit(goal);
-    try start(mobs, mob, goal);
+fn startGoal(mobs: *Mobs, mob: Mob, priority: u4) !void {
+    if (running(mob, priority)) return;
+    mob.idle.running |= @as(u16, 1) << priority;
+    try start(mobs, mob, goalsOf(mobs, mob)[priority]);
 }
 
 /// GoalSelector.goalCanBeReplacedForAllFlags: every flag is free, or held by a goal this one
 /// outranks. Every goal here may be interrupted.
-fn replaceable(mob: Mob, goal: Goal) bool {
-    const flags = goal.flags();
-    const owners = [_]struct { wanted: bool, owner: ?u3 }{
-        .{ .wanted = flags.move, .owner = mob.idle.move_owner },
-        .{ .wanted = flags.look, .owner = mob.idle.look_owner },
-        .{ .wanted = flags.jump, .owner = mob.goals.jump_owner },
+fn replaceable(traits: *const species_data.Traits, mob: Mob, priority: u4) bool {
+    const bit = @as(u16, 1) << priority;
+    const owners = [_]struct { wanted: bool, owner: ?u4 }{
+        .{ .wanted = traits.move & bit != 0, .owner = mob.idle.move_owner },
+        .{ .wanted = traits.look & bit != 0, .owner = mob.idle.look_owner },
+        .{ .wanted = traits.jump & bit != 0, .owner = mob.goals.jump_owner },
     };
     for (owners) |entry| {
         if (!entry.wanted) continue;
         const owner = entry.owner orelse continue;
-        if (!(goal.priority() < owner)) return false;
+        if (!(priority < owner)) return false;
     }
     return true;
 }
@@ -97,58 +74,75 @@ fn replaceable(mob: Mob, goal: Goal) bool {
 /// GoalSelector.tick.
 pub fn tick(mobs: *Mobs, mob: Mob) !void {
     // Mobs here carry no passengers and ride nothing, so no flag is disabled.
-    for (all) |goal| {
-        if (running(mob, goal) and !try canContinueToUse(mobs, mob, goal)) stopGoal(mobs, mob, goal);
+    const traits = mobs.traits(mob.entity.species);
+    const goals = traits.definition.goals;
+    // The running goals, by their bits in priority order, as the selector meets them.
+    var each = mob.idle.running;
+    while (each != 0) : (each &= each - 1) {
+        const priority: u4 = @intCast(@ctz(each));
+        if (!try canContinueToUse(mobs, mob, goals[priority])) stopGoal(mobs, mob, priority);
     }
     // lockedFlags.removeIf(goal is not running).
-    if (mob.idle.move_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
+    if (mob.idle.move_owner) |owner| if (!running(mob, owner)) {
         mob.idle.move_owner = null;
     };
-    if (mob.idle.look_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
+    if (mob.idle.look_owner) |owner| if (!running(mob, owner)) {
         mob.idle.look_owner = null;
     };
-    if (mob.goals.jump_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
+    if (mob.goals.jump_owner) |owner| if (!running(mob, owner)) {
         mob.goals.jump_owner = null;
     };
-    for (all) |goal| {
-        if (running(mob, goal) or !replaceable(mob, goal)) continue;
-        if (!try canUse(mobs, mob, goal)) continue;
-        const flags = goal.flags();
-        if (flags.move) {
-            if (mob.idle.move_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
-            mob.idle.move_owner = @backingInt(goal);
-        }
-        if (flags.look) {
-            if (mob.idle.look_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
-            mob.idle.look_owner = @backingInt(goal);
-        }
-        if (flags.jump) {
-            if (mob.goals.jump_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
-            mob.goals.jump_owner = @backingInt(goal);
-        }
-        try startGoal(mobs, mob, goal);
-    }
+    // The animal goals alone, as most species register, are known while compiling, and each is
+    // met by its own code; a species with goals of its own is met through them in turn.
+    if (goals.ptr == @as([*]const Goal, &species_data.animal_goals)) {
+        inline for (species_data.animal_goals, 0..) |goal, at| try consider(mobs, mob, traits, goal, at);
+    } else for (goals, 0..) |goal, at| try consider(mobs, mob, traits, goal, @intCast(at));
     try tickRunning(mobs, mob, true);
+}
+
+/// GoalSelector.tick for one goal not running: it starts if its flags are free and it can be
+/// used, taking them from the goals holding them.
+inline fn consider(mobs: *Mobs, mob: Mob, traits: *const species_data.Traits, goal: Goal, priority: u4) !void {
+    if (running(mob, priority) or !replaceable(traits, mob, priority)) return;
+    if (!try canUse(mobs, mob, goal)) return;
+    const bit = @as(u16, 1) << priority;
+    if (traits.move & bit != 0) {
+        if (mob.idle.move_owner) |owner| stopGoal(mobs, mob, owner);
+        mob.idle.move_owner = priority;
+    }
+    if (traits.look & bit != 0) {
+        if (mob.idle.look_owner) |owner| stopGoal(mobs, mob, owner);
+        mob.idle.look_owner = priority;
+    }
+    if (traits.jump & bit != 0) {
+        if (mob.goals.jump_owner) |owner| stopGoal(mobs, mob, owner);
+        mob.goals.jump_owner = priority;
+    }
+    try startGoal(mobs, mob, priority);
 }
 
 /// GoalSelector.tickRunningGoals.
 pub fn tickRunning(mobs: *Mobs, mob: Mob, every: bool) !void {
-    for (all) |goal| {
-        if (running(mob, goal) and (every or goal.requiresUpdateEveryTick())) try tickGoal(mobs, mob, goal);
-    }
+    const traits = mobs.traits(mob.entity.species);
+    var each = mob.idle.running & (if (every) ~@as(u16, 0) else traits.every_tick);
+    while (each != 0) : (each &= each - 1) try tickGoal(mobs, mob, traits.definition.goals[@ctz(each)]);
 }
 
 /// Goal.reducedTickDelay: halved, rounded up, for goals updated every other tick.
-fn reducedTickDelay(ticks: i32) i32 {
+pub fn reducedTickDelay(ticks: i32) i32 {
     return @divFloor(ticks + 1, 2);
 }
 
-fn adjustedTickDelay(goal: Goal, ticks: i32) i32 {
-    return if (goal.requiresUpdateEveryTick()) ticks else reducedTickDelay(ticks);
+fn adjustedTickDelay(goal: Shared, ticks: i32) i32 {
+    return if (requiresUpdateEveryTick(.{ .shared = goal })) ticks else reducedTickDelay(ticks);
 }
 
-fn canUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
-    return switch (goal) {
+inline fn canUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
+    const shared = switch (goal) {
+        .shared => |shared| shared,
+        .own => |own| return own.can_use(own.context, mobs, mob),
+    };
+    return switch (shared) {
         .float => floatCanUse(mobs, mob),
         .panic => try panicCanUse(mobs, mob),
         .breed => try breedCanUse(mobs, mob),
@@ -161,7 +155,11 @@ fn canUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
 }
 
 fn canContinueToUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
-    return switch (goal) {
+    const shared = switch (goal) {
+        .shared => |shared| shared,
+        .own => |own| return own.can_continue(own.context, mobs, mob),
+    };
+    return switch (shared) {
         .float => floatCanUse(mobs, mob),
         .panic => !navigation.done(mob),
         .breed => try breedCanContinue(mobs, mob),
@@ -174,11 +172,15 @@ fn canContinueToUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
 }
 
 fn start(mobs: *Mobs, mob: Mob, goal: Goal) !void {
-    switch (goal) {
+    const shared = switch (goal) {
+        .shared => |shared| shared,
+        .own => |own| return own.start(own.context, mobs, mob),
+    };
+    switch (shared) {
         .float => {},
         .panic, .stroll => {
             const target = mobs.chosen.target;
-            _ = try navigation.moveToPosition(mobs, mob, target[0], target[1], target[2], if (goal == .panic) 2.0 else 1.0);
+            _ = try navigation.moveToPosition(mobs, mob, target[0], target[1], target[2], if (shared == .panic) mobs.traits(mob.entity.species).definition.panic_speed else 1.0);
         },
         .breed => _ = try mob.put(.focus, .{ .breed = .{ .partner = mobs.chosen.partner.? } }),
         .tempt => {
@@ -199,8 +201,11 @@ fn start(mobs: *Mobs, mob: Mob, goal: Goal) !void {
 }
 
 fn stop(mobs: *Mobs, mob: Mob, goal: Goal) void {
-    _ = mobs;
-    switch (goal) {
+    const shared = switch (goal) {
+        .shared => |shared| shared,
+        .own => |own| return own.stop(own.context, mobs, mob),
+    };
+    switch (shared) {
         .float, .panic => {},
         .follow_parent => mob.drop(.follow),
         .breed, .look_at_player => mob.drop(.focus),
@@ -215,7 +220,11 @@ fn stop(mobs: *Mobs, mob: Mob, goal: Goal) void {
 }
 
 fn tickGoal(mobs: *Mobs, mob: Mob, goal: Goal) !void {
-    switch (goal) {
+    const shared = switch (goal) {
+        .shared => |shared| shared,
+        .own => |own| return own.tick(own.context, mobs, mob),
+    };
+    switch (shared) {
         .float => {
             if (mob.idle.random.nextFloat() < 0.8) mob.control.jump = true;
         },
@@ -319,7 +328,7 @@ fn freePartner(mobs: *Mobs, mob: Mob) !?u64 {
             const distance = senses.distanceSquared(context.mob, other);
             // PARTNER_TARGETING's range, which mobs see at full visibility.
             if (distance > 64) return false;
-            if (!canMate(context.mob, other) or isPanicking(other)) return false;
+            if (!canMate(context.mob, other) or isPanicking(context.mobs, other)) return false;
             if (distance < context.best_distance) {
                 context.best = other.entity.id;
                 context.best_distance = distance;
@@ -341,7 +350,7 @@ fn breedCanContinue(mobs: *Mobs, mob: Mob) !bool {
     // A partner gone from the world is no longer alive, as vanilla's removed entity.
     const breeding = mob.part(.focus).?.breed;
     const partner = (try mobs.byId(breeding.partner)) orelse return false;
-    return partner.alive() and partner.inLove() > 0 and breeding.love_time < 60 and !isPanicking(partner);
+    return partner.alive() and partner.inLove() > 0 and breeding.love_time < 60 and !isPanicking(mobs, partner);
 }
 
 fn breedTick(mobs: *Mobs, mob: Mob) !void {
@@ -363,7 +372,7 @@ fn temptCanUse(mobs: *Mobs, mob: Mob) !bool {
     const range = mobs.traits(mob.entity.species).attribute(.tempt_range);
     // A player it may follow holds its food as the tick began and is within reach, which sneaking
     // only narrows: with none such near, every player fails the conditions.
-    const near = mobs.context.audience.temptsNear(mob.motion.world, mob.motion.position, @max(range, 2.0));
+    const near = mobs.context.audience.temptsNear(mob.entity.species, mob.motion.world, mob.motion.position, @max(range, 2.0));
     const found = if (near) try senses.nearestPlayer(mobs, mob, .{ .range = range, .line_of_sight = false, .holding_food = true }, mob.motion.position) else null;
     // Asked again while it runs, the player it follows is the one found; it stops on none.
     const focus = mob.part(.focus);
@@ -384,7 +393,7 @@ fn temptTick(mobs: *Mobs, mob: Mob) !void {
     if (dx * dx + dy * dy + dz * dz < 2.5 * 2.5) {
         navigation.stop(mob);
     } else {
-        _ = try navigation.moveToEntity(mobs, mob, .{ player.position.x, player.position.y, player.position.z }, 1.25);
+        _ = try navigation.moveToEntity(mobs, mob, .{ player.position.x, player.position.y, player.position.z }, mobs.traits(mob.entity.species).definition.tempt_speed);
     }
 }
 
@@ -433,7 +442,7 @@ fn followParentTick(mobs: *Mobs, mob: Mob) !void {
     if (follow.recalculate > 0) return;
     follow.recalculate = adjustedTickDelay(.follow_parent, 10);
     const parent = (try mobs.byId(follow.parent)) orelse return;
-    _ = try navigation.moveToEntity(mobs, mob, parent.motion.position, 1.25);
+    _ = try navigation.moveToEntity(mobs, mob, parent.motion.position, mobs.traits(mob.entity.species).definition.follow_parent_speed);
 }
 
 // WaterAvoidingRandomStrollGoal.

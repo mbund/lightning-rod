@@ -240,3 +240,42 @@ fn shrink(random: std.Random, outer: body.Box) body.Box {
     if (random.boolean()) result.min[1] = @max(outer.min[1], result.max[1] - 1.0e-6);
     return result;
 }
+
+test "sheep drop wool of their colour unless shorn, and shearing gives one to three" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deps = try defaults.prepare(arena.allocator());
+    const sheep = @import("vanilla_sheep");
+    const death = deps.loot.tables.get("minecraft:entities/sheep") orelse return error.MissingSheepLoot;
+    const shearing = deps.loot.tables.get("minecraft:shearing/sheep") orelse return error.MissingShearingLoot;
+    const mutton: u32 = @intCast(game_data.registry.itemId("minecraft:mutton").?);
+    const white_wool: u32 = @intCast(game_data.registry.itemId("minecraft:white_wool").?);
+    var scratch = std.heap.FixedBufferAllocator.init(try arena.allocator().alloc(u8, 16 * 1024));
+    var prng = std.Random.DefaultPrng.init(3);
+    const Kin = @import("vanilla_mobs").mob.Kin;
+    const white: Kin = .{ .bytes = .{ @backingInt(sheep.Color.white), 0, 0, 0 } };
+    const red_shorn: Kin = .{ .bytes = .{ @backingInt(sheep.Color.red) | sheep.Wool.sheared_bit, 0, 0, 0 } };
+    for (0..50) |_| {
+        var buffer: [loot.maximum_drops]loot.Drop = undefined;
+        scratch.reset();
+        var wool: u32 = 0;
+        for (try death.evaluate(&.{ .items = deps.items, .entity_facts = sheep.woolFacts(&white), .random = prng.random(), .scratch = &scratch }, &buffer)) |drop| {
+            if (drop.kind == white_wool) wool += drop.count else if (drop.kind != mutton) return error.UnexpectedDrop;
+        }
+        try std.testing.expectEqual(@as(u32, 1), wool);
+        scratch.reset();
+        for (try death.evaluate(&.{ .items = deps.items, .entity_facts = sheep.woolFacts(&red_shorn), .random = prng.random(), .scratch = &scratch }, &buffer)) |drop| {
+            if (drop.kind != mutton) return error.ShornSheepDroppedWool;
+        }
+        scratch.reset();
+        var shorn: u32 = 0;
+        for (try shearing.evaluate(&.{ .items = deps.items, .entity_facts = sheep.woolFacts(&white), .random = prng.random(), .scratch = &scratch }, &buffer)) |drop| {
+            if (drop.kind != white_wool) return error.UnexpectedShearing;
+            shorn += drop.count;
+        }
+        try std.testing.expect(shorn >= 1 and shorn <= 3);
+        // A sheep shorn already gives nothing more.
+        scratch.reset();
+        try std.testing.expectEqual(@as(usize, 0), (try shearing.evaluate(&.{ .items = deps.items, .entity_facts = sheep.woolFacts(&red_shorn), .random = prng.random(), .scratch = &scratch }, &buffer)).len);
+    }
+}

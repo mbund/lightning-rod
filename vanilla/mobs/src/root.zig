@@ -1,4 +1,5 @@
-//! Mobs: vanilla's mob bodies, pathfinding, goals and the cow.
+//! Mobs: vanilla's mob bodies, pathfinding, goals and the species registry every mob plugin, as the
+//! cow's and the sheep's, registers with.
 const std = @import("std");
 
 pub const mth = @import("vanilla_bodies").mth;

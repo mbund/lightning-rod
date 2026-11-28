@@ -28,7 +28,7 @@ fn spawn(_: *const Players.Player) minecraft.Position {
 const Probe = struct {
     pub const id = "e2e:melee";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, control: *e2e.Control };
+    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, cow: *vanilla.Cow, control: *e2e.Control };
     const sword_slot: u16 = 36;
     deps: Dependencies,
     cows: [3]u64 = undefined,
@@ -49,7 +49,7 @@ const Probe = struct {
             if (self.spawned) return error.ChargedTwice;
             // A cow's box is 0.9 wide: the neighbors stand clear of the middle one, inside its
             // box grown by one, and within three blocks of Alice.
-            for (&self.cows, [_]f64{ -0.65, 0.5, 1.65 }) |*cow, x| cow.* = try self.deps.mobs.spawn(.{ .species = .cow, .world = self.deps.players.records[0].world, .position = .{ x, 65, -1.5 }, .yaw = 0 });
+            for (&self.cows, [_]f64{ -0.65, 0.5, 1.65 }) |*cow, x| cow.* = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = self.deps.players.records[0].world, .position = .{ x, 65, -1.5 }, .yaw = 0 });
             self.spawned = true;
             var buffer: [32]u8 = undefined;
             // The id its client knows it by.

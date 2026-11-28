@@ -59,6 +59,7 @@ const Mob = mob_state.Mob;
 const Boats = @import("boats.zig").Boats;
 const MobState = mob_state.MobState;
 const Species = mob_state.Species;
+const max_species = mob_state.max_species;
 const assert = std.debug.assert;
 
 /// Sounds mobs make, by vanilla's sound event names.
@@ -71,11 +72,6 @@ pub const Sound = enum {
     generic_extinguish_fire,
     generic_eat,
     honey_block_slide,
-    cow_ambient,
-    cow_hurt,
-    cow_death,
-    cow_step,
-    cow_milk,
     amethyst_block_chime,
     turtle_egg_break,
 
@@ -89,11 +85,6 @@ pub const Sound = enum {
             .generic_extinguish_fire => "minecraft:entity.generic.extinguish_fire",
             .generic_eat => "minecraft:entity.generic.eat",
             .honey_block_slide => "minecraft:block.honey_block.slide",
-            .cow_ambient => "minecraft:entity.cow.ambient",
-            .cow_hurt => "minecraft:entity.cow.hurt",
-            .cow_death => "minecraft:entity.cow.death",
-            .cow_step => "minecraft:entity.cow.step",
-            .cow_milk => "minecraft:entity.cow.milk",
             .amethyst_block_chime => "minecraft:block.amethyst_block.chime",
             .turtle_egg_break => "minecraft:entity.turtle.egg_break",
         };
@@ -152,7 +143,6 @@ pub const Mobs = struct {
     /// Every mob's components, a row each in the mobs' table, in the tick order's sequence, each
     /// component a column: `inSlot` gives where a mob's records lie, good until the tick's end.
     rows: Table,
-    cow_type: u32,
     /// Where every entity is, by section and in the order each came into its own, as vanilla's
     /// entity sections keep them, and the order they tick in: shared by every kind.
     places: *entities.Places,
@@ -171,7 +161,12 @@ pub const Mobs = struct {
     ordered: entities.Array(u32),
     /// The classes of blocks, as the levels have them.
     blocks: *mob_blocks.MobBlocks,
-    species: [@typeInfo(Species).@"enum".field_names.len]species_data.Traits,
+    /// The species registered, by their Species.
+    species: [max_species]species_data.Traits = undefined,
+    species_count: u8 = 0,
+    /// Told of every species as it registers, and of those before when they start listening.
+    species_listeners: [4]SpeciesListener = undefined,
+    species_listener_count: usize = 0,
     /// The level's random, which a few block reactions draw from.
     level_random: JavaRandom,
     /// Seeds for new mobs' randoms, as RandomSupport.generateUniqueSeed gives each entity its own.
@@ -229,14 +224,16 @@ pub const Mobs = struct {
     effects_scratch: @import("block_effects.zig").Scratch = .{},
     /// What each player answers as pushable through the players' pushes, by player slot.
     player_pushable: []?body.Box,
-    /// By player slot, whether the player holds cow food in either hand, noted as mobs start
-    /// ticking: tempting asks every other tick for every mob, and hands change only between.
-    holding_food: []bool,
+    /// By player slot, a bit by Species for those whose food the player holds in either hand,
+    /// noted as mobs start ticking: tempting asks every other tick for every mob, and hands
+    /// change only between.
+    holding_food: []u16,
     /// The players idle mobs look for this tick.
     present: []herd_state.Audience.Player,
     present_count: usize = 0,
-    holders: []herd_state.Audience.Player,
-    holder_count: usize = 0,
+    /// By species, the present players holding its food.
+    holders: [max_species][]herd_state.Audience.Player,
+    holder_counts: [max_species]usize = @splat(0),
     /// Set while Debug checks an idle tick against the full one, which then plays no sound.
     muted: bool = false,
     /// Rises whenever columns start or stop ticking.
@@ -255,8 +252,10 @@ pub const Mobs = struct {
     /// The last path found, until a navigation takes it.
     scratch_path: []pathfinding.PathNode,
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
-    /// The cow_food item tag and the panic_causes damage type tag, read when definitions change.
-    food_tag: ?content_tags.Tags.Id = null,
+    /// By species, its food item tag, read when definitions change.
+    food_tags: [max_species]?content_tags.Tags.Id = @splat(null),
+    /// The dirt trampled farmland turns to.
+    dirt_state: u16,
     /// Loot tables draw from their own random, as each vanilla table has its own sequence.
     loot_random: std.Random.DefaultPrng,
     loot_scratch: std.heap.FixedBufferAllocator,
@@ -271,12 +270,10 @@ pub const Mobs = struct {
         if (config.edits == 0) return error.InvalidEditCapacity;
         const self = try allocator.create(Mobs);
         const pool = &deps.entities.pool;
-        const cow_type: u32 = @intCast(game_data.registry.entityId("minecraft:cow").?);
         self.* = .{
             .deps = deps,
             .config = config,
             .rows = try .init(allocator, pool, &deps.entities.directory),
-            .cow_type = cow_type,
             .places = &deps.entities.places,
             .kinds = .{},
             .widest_half = 0,
@@ -286,7 +283,6 @@ pub const Mobs = struct {
             .ordered = try .init(allocator, pool),
             .blocks = deps.levels.blocks,
             .windows = try allocator.alloc(KeptWindow, config.windows),
-            .species = undefined,
             .level_random = .init(@bitCast(config.seed)),
             .seeds = .init(config.seed ^ 0x73656564),
             .sound_seeds = .init(config.seed ^ 0x736f756e64),
@@ -302,38 +298,80 @@ pub const Mobs = struct {
             .scratch_path = try allocator.alloc(pathfinding.PathNode, path_capacity),
             .edits = try allocator.alloc(body.Edit, config.edits),
             .events = try allocator.alloc(mob_state.Event, config.events),
-            .holding_food = try allocator.alloc(bool, deps.players.records.len),
+            .holding_food = try allocator.alloc(u16, deps.players.records.len),
             .present = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
-            .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
+            .holders = undefined,
+            .dirt_state = @intCast(game_data.registry.blockStateId("minecraft:dirt").?),
             .overlay = try .init(allocator, config.edits + chunks.edit_previous_max),
         };
         @memset(self.windows, .{});
+        for (&self.holders) |*held| held.* = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len);
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
         try deps.chunks.observe(.init(self, blocksChanged));
         try deps.domains.observe(.init(Mobs, self, domainsChanged));
         try deps.client.registry.onChange(self, readTags);
-        inline for (@typeInfo(Species).@"enum".field_names, 0..) |field, index| self.species[index] = species_data.traits(@field(Species, field));
-        for (self.species) |species| self.kinds.bits.set(species.entity_type);
-        // Each species tracks at its own range, as EntityType clientTrackingRange says.
-        for (self.species) |species| try deps.entities.declare(.{ .kinds = .of(&.{species.entity_type}), .tracking_range = @as(u32, species.tracking_range) * 16 });
-        for (self.species) |species| try deps.entities.addTable(species.entity_type, &self.rows.core);
-        // Mobs take their turns in the one tick order, as many as fill a pass's run.
-        try deps.entities.addTicker(.init(Mobs, self, self.kinds, entities.Entities.run_max));
+        // Mobs take their turns in the one tick order, as many as fill a pass's run, each species'
+        // kind added as it registers.
+        try deps.entities.addTicker(.init(Mobs, self, .{}, entities.Entities.run_max));
         try deps.entities.addColumnHolder(.init(Mobs, self, loadColumn, unloadColumn));
-        // How mobs and players meet others, living bodies both: pushable, which vehicles collide
-        // with and what pushes, and pickable.
-        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable, .pickable = mobPickable, .living = mobPickable, .position = mobPosition, .nudge = mobNudge, .touched = mobTouched });
         try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable, .pickable = playerPickable, .living = playerPickable, .position = playerPosition });
-        for (self.species) |species| {
-            self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
-            self.tallest = @max(self.tallest, @as(f64, species.height));
-        }
         return self;
+    }
+
+    /// A species' plugin says what it is, while the server starts: its mobs tick, collide, are
+    /// tracked at its range and kept from then on.
+    pub fn register(self: *Mobs, definition: species_data.Definition) !Species {
+        if (self.species_count == max_species) return error.TooManySpecies;
+        const made = try species_data.traits(definition);
+        for (self.species[0..self.species_count]) |known| if (known.entity_type == made.entity_type) return error.SpeciesRegisteredTwice;
+        const species: Species = @fromBackingInt(@intCast(self.species_count));
+        self.species[self.species_count] = made;
+        self.species_count += 1;
+        const kind = made.entity_type;
+        const one: entities.Kinds = .of(&.{kind});
+        self.kinds.bits.set(kind);
+        // Each species tracks at its own range, as EntityType clientTrackingRange says.
+        try self.deps.entities.declare(.{ .kinds = one, .tracking_range = @as(u32, made.tracking_range) * 16 });
+        try self.deps.entities.addTable(kind, &self.rows.core);
+        try self.deps.entities.addTickerKind(self, kind);
+        // How mobs meet others, living bodies all: pushable, which vehicles collide with and what
+        // pushes, and pickable.
+        try self.deps.collisions.register(one, .{ .context = self, .pushable = mobPushable, .pickable = mobPickable, .living = mobPickable, .position = mobPosition, .nudge = mobNudge, .touched = mobTouched });
+        self.widest_half = @max(self.widest_half, @as(f64, made.width) / 2);
+        self.tallest = @max(self.tallest, @as(f64, made.height));
+        try self.readTags();
+        for (self.species_listeners[0..self.species_listener_count]) |listener| try listener.registered(listener.context, species);
+        return species;
+    }
+
+    /// Told of each species as it registers.
+    pub const SpeciesListener = struct {
+        context: *anyopaque,
+        registered: *const fn (context: *anyopaque, species: Species) anyerror!void,
+    };
+
+    /// Listens for species, told at once of those registered before.
+    pub fn onSpecies(self: *Mobs, listener: SpeciesListener) !void {
+        if (self.species_listener_count == self.species_listeners.len) return error.TooManySpeciesListeners;
+        self.species_listeners[self.species_listener_count] = listener;
+        self.species_listener_count += 1;
+        for (0..self.species_count) |index| try listener.registered(listener.context, @fromBackingInt(@intCast(index)));
     }
 
     pub fn traits(self: *const Mobs, species: Species) *const species_data.Traits {
         return &self.species[@backingInt(species)];
+    }
+
+    /// The species registered.
+    pub fn allSpecies(self: *const Mobs) []const species_data.Traits {
+        return self.species[0..self.species_count];
+    }
+
+    /// The species whose mobs are entities of a type, if one registered.
+    pub fn speciesOfType(self: *const Mobs, entity_type: u32) ?Species {
+        for (self.species[0..self.species_count], 0..) |known, index| if (known.entity_type == entity_type) return @fromBackingInt(@intCast(index));
+        return null;
     }
 
     pub fn level(self: *Mobs, world: u32) body.Level {
@@ -385,7 +423,9 @@ pub const Mobs = struct {
         position: [3]f64,
         yaw: f32,
         baby: bool = false,
-        variant: u8 = 0,
+        /// What its species keeps of it, where the request knows: else zero, and spawning that
+        /// finalizes lets the species say.
+        kin: mob_state.Kin = .{},
         /// Mob.finalizeSpawn, which spawning from eggs and commands runs and breeding does not.
         finalize: bool = true,
     };
@@ -416,9 +456,12 @@ pub const Mobs = struct {
             .living = .{
                 .health = @floatCast(traits_entry.attribute(.max_health)),
             },
-            .cow = .{ .variant = request.variant },
+            .kin = request.kin,
         };
         if (request.finalize) {
+            // The species' own finalizeSpawn first, as Sheep's takes its colour before Mob's draws.
+            const hooks = traits_entry.definition.hooks;
+            if (hooks.finalize) |finalize| try finalize(hooks.context, self, &created);
             // Mob.finalizeSpawn: a random bonus to the follow range, then the left hand chance.
             created.living.follow_range_bonus = self.level_random.triangle(0.0, 0.11485000000000001);
             created.control.left_handed = self.level_random.nextFloat() < 0.05;
@@ -517,7 +560,7 @@ pub const Mobs = struct {
 
     fn rowOf(state: MobState) Row {
         var row: Row = undefined;
-        row.tracking = .{};
+        row.tracking = .{ .species = state.entity.species };
         row.extras = mob_extras.none;
         inline for (Mob.groups) |name| @field(row, name) = @field(state, name);
         return row;
@@ -654,9 +697,8 @@ pub const Mobs = struct {
         try self.answerEdits();
         try self.wakeTouched();
         const audience = self.noteAudience();
-        const cow = self.traits(.cow);
-        const species: herd_state.Species = .{ .tempt_range = cow.attribute(.tempt_range), .eye_height = cow.eye_height, .ambient_interval = cow.ambient_interval };
-        self.context = .{ .audience = audience, .species = species, .volume = cow.sound_volume };
+        self.context = .{ .audience = audience };
+        for (self.allSpecies(), 0..) |known, index| self.context.species[index] = .{ .which = @fromBackingInt(@intCast(index)), .tempt_range = known.attribute(.tempt_range), .eye_height = known.eye_height, .ambient_interval = known.ambient_interval };
     }
 
     /// A mob's pushEntities finds the players its box meets, and each pushes it, which one
@@ -798,8 +840,8 @@ pub const Mobs = struct {
 
     const TickContext = struct {
         audience: herd_state.Audience,
-        species: herd_state.Species,
-        volume: f32,
+        /// By Species, what idle ticks need of it.
+        species: [max_species]herd_state.Species = undefined,
         ticking: TickingMemo = .{},
     };
 
@@ -847,7 +889,8 @@ pub const Mobs = struct {
             run.given[lane] = givenOfSlot(slots[lane]);
             run.gaze_yaw[lane] = trackings[lane].gaze_yaw;
         }
-        const block = herd_state.advanceBlock(run, context.audience, context.species);
+        // A run is of one kind, so of one species.
+        const block = herd_state.advanceBlock(run, context.audience, context.species[@backingInt(Table.columnOf(first.block, "entity")[first.row].species)]);
         self.idle_blocks += 1;
         if (!block.any_rare) {
             herd_state.commitBlock(run, &block);
@@ -897,13 +940,14 @@ pub const Mobs = struct {
             if (!self.idleTicks(tracking, motion, &context.ticking)) return;
             const before = if (verify_idle) try self.copyAt(index) else {};
             const still: herd_state.Still = .{ .world = motion.world, .position = motion.position, .persistent = row.field("control").persistence_required, .given = givenOfSlot(index) };
-            switch (herd_state.advance(row.field("idle"), still, &tracking.gaze_yaw, context.audience, context.species)) {
+            const species = tracking.species;
+            switch (herd_state.advance(row.field("idle"), still, &tracking.gaze_yaw, context.audience, context.species[@backingInt(species)])) {
                 .idled => |sound| {
                     self.idle_ticks += 1;
                     // Mob.playAmbientSound, once the tick is sure to stand.
                     if (sound) |pitch| {
                         const at = motion.position;
-                        self.effects.sound(motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, Sound.cow_ambient.name(), .neutral, context.volume, pitch, @bitCast(self.sound_seeds.next()), null);
+                        self.effects.sound(motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, self.traits(species).definition.sounds.ambient, .neutral, self.traits(species).definition.sound_volume, pitch, @bitCast(self.sound_seeds.next()), null);
                     }
                     if (verify_idle) try self.checkIdle(index, before);
                     return;
@@ -989,18 +1033,22 @@ pub const Mobs = struct {
     /// The players idle mobs look for, as mobs start ticking and players stand still.
     fn noteAudience(self: *Mobs) herd_state.Audience {
         self.present_count = 0;
-        self.holder_count = 0;
+        self.holder_counts = @splat(0);
         for (self.deps.players.activeSlots()) |slot| {
             const player = &self.deps.players.records[slot];
             if (player.stage != .ready or self.deps.player_states.of(player).gamemode == .spectator) continue;
             const entry: herd_state.Audience.Player = .{ .world = player.world, .position = .{ player.position.x, player.position.y, player.position.z } };
             self.present[self.present_count] = entry;
             self.present_count += 1;
-            if (!self.holding_food[slot]) continue;
-            self.holders[self.holder_count] = entry;
-            self.holder_count += 1;
+            for (0..self.species_count) |at| {
+                if (self.holding_food[slot] & (@as(u16, 1) << @intCast(at)) == 0) continue;
+                self.holders[at][self.holder_counts[at]] = entry;
+                self.holder_counts[at] += 1;
+            }
         }
-        return .{ .present = self.present[0..self.present_count], .holding_food = self.holders[0..self.holder_count] };
+        var holding: [max_species][]const herd_state.Audience.Player = undefined;
+        for (&holding, self.holders, self.holder_counts) |*each, held, count| each.* = held[0..count];
+        return .{ .present = self.present[0..self.present_count], .holding_food = holding };
     }
 
     /// Debug builds check every idle tick against the full tick it stands for.
@@ -1238,7 +1286,7 @@ pub const Mobs = struct {
     /// Tags come with the definitions, which a datapack may change.
     fn readTags(self: *Mobs) !void {
         const tags = &self.deps.items.deps.definitions.tags;
-        self.food_tag = tags.find("minecraft:cow_food");
+        for (self.allSpecies(), 0..) |known, index| self.food_tags[index] = tags.find(known.definition.food_tag);
     }
 
     pub fn damageFlags(self: *const Mobs, damage_type: mob_state.DamageType) damage_types.Flags {
@@ -1250,37 +1298,51 @@ pub const Mobs = struct {
         return self.deps.damage_types.idOf(damage_type);
     }
 
-    /// AbstractCow.isFood: the cow_food item tag.
     fn noteHeldFood(self: *Mobs) !void {
-        for (self.deps.players.activeSlots()) |slot| self.holding_food[slot] = try self.holdsFoodNow(@intCast(slot));
+        for (self.deps.players.activeSlots()) |slot| self.holding_food[slot] = try self.foodHeldNow(@intCast(slot));
     }
 
-    /// Whether a player holds food the mob is tempted by in either hand.
-    fn holdsFoodNow(self: *Mobs, slot: u32) !bool {
+    /// A bit by Species for those whose food a player holds in either hand.
+    fn foodHeldNow(self: *Mobs, slot: u32) !u16 {
         const player = &self.deps.players.records[slot];
         const state = self.deps.player_states.of(player);
         const slots = [_]inventories.Slot{
             .{ .owner = player.uuid, .index = 36 + @as(u16, state.selected_slot) },
             .{ .owner = player.uuid, .index = 45 },
         };
+        var result: u16 = 0;
         for (slots) |held| {
             const stack = (try self.deps.inventories.get(held)).stack orelse continue;
-            if (try self.isFood(stack)) return true;
+            for (0..self.species_count) |at| {
+                if (try self.isFood(stack, @fromBackingInt(@intCast(at)))) result |= @as(u16, 1) << @intCast(at);
+            }
         }
-        return false;
+        return result;
     }
 
-    /// Whether the player held cow food when mobs started ticking.
-    pub fn holdsFood(self: *const Mobs, slot: u32) bool {
+    /// Whether the player held the species' food when mobs started ticking.
+    pub fn holdsFood(self: *const Mobs, slot: u32, species: Species) bool {
         assert(self.ticking);
-        return self.holding_food[slot];
+        return self.holding_food[slot] & (@as(u16, 1) << @intCast(@backingInt(species))) != 0;
     }
 
-    pub fn isFood(self: *Mobs, stack: inventories.Stack) !bool {
-        const tag = self.food_tag orelse return false;
+    /// Animal.isFood: the species' food item tag.
+    pub fn isFood(self: *Mobs, stack: inventories.Stack, species: Species) !bool {
+        const tag = self.food_tags[@backingInt(species)] orelse return false;
         const pinned = try self.deps.items.acquire(stack);
         defer pinned.release();
         return self.deps.items.deps.definitions.tags.contains(tag, pinned.view.kind);
+    }
+
+    /// Mob.ate, as the species overrides it.
+    pub fn ate(self: *Mobs, mob: Mob) !void {
+        const hooks = self.traits(mob.entity.species).definition.hooks;
+        if (hooks.ate) |ate_hook| try ate_hook(hooks.context, self, mob);
+    }
+
+    /// A species' kin changed what viewers see of the mob, as its synced data.
+    pub fn kinChanged(_: *Mobs, mob: Mob) void {
+        mob.entity.revision +%= 1;
     }
 
     /// PanicGoal.shouldPanic: damage of a type in panic_causes, in the last two seconds, as
@@ -1328,9 +1390,7 @@ pub const Mobs = struct {
 
     /// Animal.spawnChildFromBreeding with Cow.getBreedOffspring.
     pub fn breed(self: *Mobs, mob: Mob, partner: Mob) !void {
-        const variant = if (mob.idle.random.nextBoolean()) mob.cow.variant else partner.cow.variant;
-        const child = try self.spawnChild(mob, variant);
-        _ = child;
+        _ = try self.spawnOffspring(mob, partner);
         // Animal.finalizeSpawnChildFromBreeding.
         self.setAge(mob, 6000);
         self.setAge(partner, 6000);
@@ -1342,17 +1402,26 @@ pub const Mobs = struct {
         try self.deps.experience.spawnOrb(mob.motion.world, mob.motion.position, value);
     }
 
-    fn spawnChild(self: *Mobs, parent: Mob, variant: u8) !u64 {
-        // EntityType.create for breeding, then setBaby and snapTo the parent with no rotation.
-        return self.spawn(.{ .species = parent.entity.species, .world = parent.motion.world, .position = parent.motion.position, .yaw = 0, .baby = true, .variant = variant, .finalize = false });
+    /// AgeableMob.getBreedOffspring, as breeding and a spawn egg used on a mob ask it, then setBaby
+    /// and snapTo the parent with no rotation: the young one's kin as its species makes it.
+    pub fn spawnOffspring(self: *Mobs, parent: Mob, other: Mob) !u64 {
+        var request: Spawn = .{ .species = parent.entity.species, .world = parent.motion.world, .position = parent.motion.position, .yaw = 0, .baby = true, .finalize = false };
+        const hooks = self.traits(parent.entity.species).definition.hooks;
+        if (hooks.offspring) |offspring| try offspring(hooks.context, self, parent, other, &request.kin);
+        return self.spawn(request);
     }
 
     // What moving and living cause.
 
     pub fn playSound(self: *Mobs, mob: Mob, sound: Sound, volume: f32, pitch: f32) void {
+        self.playNamed(mob, sound.name(), volume, pitch);
+    }
+
+    /// Mob.playSound of a sound event by name, as a species names its voice.
+    pub fn playNamed(self: *Mobs, mob: Mob, name: []const u8, volume: f32, pitch: f32) void {
         if (self.muted) return;
         const at: minecraft.Position = .{ .x = mob.motion.position[0], .y = mob.motion.position[1], .z = mob.motion.position[2] };
-        self.effects.sound(mob.motion.world, at, sound.name(), .neutral, volume, pitch, @bitCast(self.sound_seeds.next()), null);
+        self.effects.sound(mob.motion.world, at, name, .neutral, volume, pitch, @bitCast(self.sound_seeds.next()), null);
     }
 
     pub fn blockSound(self: *Mobs, world: u32, at: [3]f64, sound: Sound, volume: f32, pitch: f32) void {
@@ -1361,9 +1430,7 @@ pub const Mobs = struct {
 
     /// Mob.playStepSound as each species overrides it.
     pub fn stepSound(self: *Mobs, mob: Mob, _: u16) void {
-        switch (mob.entity.species) {
-            .cow => self.playSound(mob, .cow_step, 0.15, 1.0),
-        }
+        self.playNamed(mob, self.traits(mob.entity.species).definition.sounds.step, 0.15, 1.0);
     }
 
     /// The block's fall sound at half volume and three quarters pitch. Block sound types are not
@@ -1426,10 +1493,10 @@ pub const Mobs = struct {
     }
 
     /// LivingEntity.makeSound: at the mob's volume and voice pitch.
-    pub fn makeSound(self: *Mobs, mob: Mob, sound: Sound) void {
-        const volume = self.traits(mob.entity.species).sound_volume;
+    pub fn makeSound(self: *Mobs, mob: Mob, sound: []const u8) void {
+        const volume = self.traits(mob.entity.species).definition.sound_volume;
         const pitch = self.voicePitch(mob);
-        self.playSound(mob, sound, volume, pitch);
+        self.playNamed(mob, sound, volume, pitch);
     }
 
     /// Animal.setInLove: ten seconds of hearts.
@@ -1462,10 +1529,7 @@ pub const Mobs = struct {
     /// LivingEntity.dropFromLootTable: the species' table, knowing whether the mob burned, who
     /// killed it and with what, dropped where it died as Entity.spawnAtLocation drops items.
     pub fn dropLoot(self: *Mobs, mob: Mob, dealt: mob_state.Damage, by_player: bool) !void {
-        const name = switch (mob.entity.species) {
-            .cow => "minecraft:entities/cow",
-        };
-        const table = self.deps.loot.tables.get(name) orelse return;
+        const table = self.deps.loot.tables.get(self.traits(mob.entity.species).definition.loot_table) orelse return;
         self.loot_scratch.reset();
         var weapon: ?Items.Prepared = null;
         defer if (weapon) |pinned| pinned.release();
@@ -1483,6 +1547,7 @@ pub const Mobs = struct {
             .attacker_weapon = if (weapon) |pinned| pinned.view else null,
             .smelter = .{ .context = self, .smelt = smelt },
             .enchantment_tags = .{ .context = self, .contains = enchantmentInTag },
+            .entity_facts = self.factsOf(mob),
             .random = self.loot_random.random(),
             .scratch = &self.loot_scratch,
         };
@@ -1504,6 +1569,12 @@ pub const Mobs = struct {
             };
         }
         try self.deps.dropped.createMany(requests[0..drops.len], spawned[0..drops.len]);
+    }
+
+    /// What a mob's loot tables' entity_properties may ask of it, as its species says.
+    pub fn factsOf(self: *const Mobs, mob: Mob) ?loot.EntityFacts {
+        const facts = self.traits(mob.entity.species).definition.hooks.facts orelse return null;
+        return facts(mob);
     }
 
     fn enchantmentInTag(context: *const anyopaque, tag: []const u8, enchantment: []const u8) bool {
@@ -1546,11 +1617,9 @@ pub const Mobs = struct {
 
     /// Mob.playAmbientSound.
     pub fn ambientSound(self: *Mobs, mob: Mob) void {
-        const volume = self.traits(mob.entity.species).sound_volume;
+        const definition = self.traits(mob.entity.species).definition;
         const pitch = self.voicePitch(mob);
-        switch (mob.entity.species) {
-            .cow => self.playSound(mob, .cow_ambient, volume, pitch),
-        }
+        self.playNamed(mob, definition.sounds.ambient, definition.sound_volume, pitch);
     }
 
     /// AgeableMob.setAge: growing up or becoming a baby changes the size viewers see.
@@ -1749,7 +1818,7 @@ pub const Mobs = struct {
 
     /// FarmBlock.turnToDirt.
     pub fn trampleFarmland(self: *Mobs, world: u32, position: [3]i32, _: u16) !void {
-        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, @intCast(game_data.registry.blockStateId("minecraft:dirt").?));
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, self.dirt_state);
     }
 
     /// TurtleEggBlock.decreaseEggs: the crack sound, then one egg fewer, or none left.
@@ -1803,11 +1872,18 @@ pub const Mobs = struct {
 
     const encoded_size = 160;
 
-    fn encode(mob: *const MobState) [encoded_size]u8 {
+    /// A mob's record as read back, before its species is found by its entity type.
+    const Saved = struct { state: MobState, entity_type: u32 };
+
+    /// The record format written. Version 1 kept cows alone, its second byte a species number,
+    /// zero for the cow, and the variant where the first kin byte goes.
+    const record_version = 2;
+
+    fn encode(mob: *const MobState, entity_type: u32) [encoded_size]u8 {
         var bytes: [encoded_size]u8 = @splat(0);
         var writer = std.Io.Writer.fixed(&bytes);
-        writer.writeByte(1) catch unreachable;
-        writer.writeByte(@backingInt(mob.entity.species)) catch unreachable;
+        writer.writeByte(record_version) catch unreachable;
+        writer.writeByte(0) catch unreachable;
         writer.writeInt(u128, mob.entity.uuid, .little) catch unreachable;
         writer.writeInt(u32, mob.motion.world, .little) catch unreachable;
         for (mob.motion.position ++ mob.motion.velocity) |value| writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
@@ -1827,15 +1903,18 @@ pub const Mobs = struct {
         writer.writeInt(u128, breeding.love_cause orelse 0, .little) catch unreachable;
         writer.writeByte(@as(u8, @intFromBool(breeding.love_cause != null)) | @as(u8, @intFromBool(mob.control.persistence_required)) << 1 | @as(u8, @intFromBool(mob.control.left_handed)) << 2 | @as(u8, @intFromBool(mob.control.no_ai)) << 3) catch unreachable;
         writer.writeInt(u64, @bitCast(mob.living.follow_range_bonus), .little) catch unreachable;
-        writer.writeByte(mob.cow.variant) catch unreachable;
+        writer.writeByte(mob.kin.bytes[0]) catch unreachable;
         writer.writeInt(u64, mob.idle.random.state(), .little) catch unreachable;
+        writer.writeAll(mob.kin.bytes[1..]) catch unreachable;
+        writer.writeInt(u16, @intCast(entity_type), .little) catch unreachable;
         return bytes;
     }
 
-    fn decode(entity: u64, bytes: []const u8) !MobState {
-        if (bytes.len != encoded_size or bytes[0] != 1) return error.CorruptMob;
+    fn decode(entity: u64, bytes: []const u8) !Saved {
+        if (bytes.len != encoded_size or bytes[0] == 0 or bytes[0] > record_version) return error.CorruptMob;
+        const version = bytes[0];
         var reader = std.Io.Reader.fixed(bytes[1..]);
-        const species = std.enums.fromInt(Species, try reader.takeByte()) orelse return error.CorruptMob;
+        if (try reader.takeByte() != 0) return error.CorruptMob;
         const uuid = try reader.takeInt(u128, .little);
         const world = try reader.takeInt(u32, .little);
         var vectors: [6]f64 = undefined;
@@ -1855,56 +1934,73 @@ pub const Mobs = struct {
         const love_cause = try reader.takeInt(u128, .little);
         const flags = try reader.takeByte();
         const follow_range_bonus: f64 = @bitCast(try reader.takeInt(u64, .little));
-        const variant = try reader.takeByte();
+        var kin: mob_state.Kin = .{};
+        kin.bytes[0] = try reader.takeByte();
         const random_state = try reader.takeInt(u64, .little);
+        try reader.readSliceAll(kin.bytes[1..]);
+        const stored_type = try reader.takeInt(u16, .little);
+        const entity_type: u32 = if (version == 1) cow_type else stored_type;
         for (vectors) |value| if (!std.math.isFinite(value)) return error.CorruptMob;
         if (!std.math.isFinite(yaw) or !std.math.isFinite(pitch) or !std.math.isFinite(health) or on_ground > 1) return error.CorruptMob;
         const position: [3]f64 = vectors[0..3].*;
         return .{
-            .entity = .{
-                .id = entity,
-                .uuid = uuid,
-                .species = species,
-                .fire_ticks = fire_ticks,
-            },
-            .idle = .{
-                .random = .restore(random_state),
-                .head_yaw = yaw,
-                .body_yaw = yaw,
-                .age = age,
-            },
-            .motion = .{
-                .world = world,
-                .position = position,
-                .old_position = position,
-                .velocity = vectors[3..6].*,
-                .yaw = yaw,
-                .pitch = pitch,
-                .old_yaw = yaw,
-                .old_pitch = pitch,
-                .fall_distance = fall_distance,
-                .on_ground = on_ground != 0,
-            },
-            .living = .{
-                .air_supply = air_supply,
-                .health = health,
-                .hurt_time = hurt_time,
-                .death_time = death_time,
-                .follow_range_bonus = follow_range_bonus,
-            },
-            .control = .{
-                .persistence_required = flags & 2 != 0,
-                .left_handed = flags & 4 != 0,
-                .no_ai = flags & 8 != 0,
-            },
-            .rare = .{
-                .ageing = if (forced_age != 0) .{ .forced_age = forced_age } else null,
-                .breeding = if (in_love != 0 or flags & 1 != 0) .{ .in_love = in_love, .love_cause = if (flags & 1 != 0) love_cause else null } else null,
-            },
-            .cow = .{
-                .variant = variant,
+            .entity_type = entity_type,
+            .state = .{
+                .entity = .{
+                    .id = entity,
+                    .uuid = uuid,
+                    // Found by its entity type once read.
+                    .species = undefined,
+                    .fire_ticks = fire_ticks,
+                },
+                .idle = .{
+                    .random = .restore(random_state),
+                    .head_yaw = yaw,
+                    .body_yaw = yaw,
+                    .age = age,
+                },
+                .motion = .{
+                    .world = world,
+                    .position = position,
+                    .old_position = position,
+                    .velocity = vectors[3..6].*,
+                    .yaw = yaw,
+                    .pitch = pitch,
+                    .old_yaw = yaw,
+                    .old_pitch = pitch,
+                    .fall_distance = fall_distance,
+                    .on_ground = on_ground != 0,
+                },
+                .living = .{
+                    .air_supply = air_supply,
+                    .health = health,
+                    .hurt_time = hurt_time,
+                    .death_time = death_time,
+                    .follow_range_bonus = follow_range_bonus,
+                },
+                .control = .{
+                    .persistence_required = flags & 2 != 0,
+                    .left_handed = flags & 4 != 0,
+                    .no_ai = flags & 8 != 0,
+                },
+                .rare = .{
+                    .ageing = if (forced_age != 0) .{ .forced_age = forced_age } else null,
+                    .breeding = if (in_love != 0 or flags & 1 != 0) .{ .in_love = in_love, .love_cause = if (flags & 1 != 0) love_cause else null } else null,
+                },
+                .kin = kin,
             },
         };
+    }
+
+    /// The cow's entity type, which version 1 records are of.
+    const cow_type: u32 = @intCast(game_data.registry.entityId("minecraft:cow").?);
+
+    /// A record read back as a mob of its species, which must be registered.
+    fn restore(self: *const Mobs, entity: u64, bytes: []const u8) !MobState {
+        const saved = try decode(entity, bytes);
+        var state = saved.state;
+        state.entity.species = self.speciesOfType(saved.entity_type) orelse return error.UnknownSpecies;
+        return state;
     }
 
     /// Mobs are kept under the column each stood in when saved, so a column comes back with one
@@ -1932,7 +2028,8 @@ pub const Mobs = struct {
             for (entries[0..found.count], &gone) |entry, *write| {
                 if (entry.key_len != 9 or entry.key[0] != old_prefix) return error.CorruptMob;
                 const entity = std.mem.readInt(u64, entry.key[1..9], .big);
-                const restored = try decode(entity, entry.value[0..entry.value_len]);
+                // Its place alone matters here, before species register.
+                const restored = (try decode(entity, entry.value[0..entry.value_len])).state;
                 if (self.deps.worlds.get(restored.motion.world) == null) return error.CorruptMob;
                 try batch.put(entities.durable.key(record_prefix, entities.space.columnOf(restored.motion.world, restored.motion.position), entity), entry.value[0..entry.value_len]);
                 write.* = .{ .key = entry.key[0..9], .value = null };
@@ -1964,7 +2061,7 @@ pub const Mobs = struct {
             try self.locate(index);
             return;
         }
-        const restored = try decode(entity, value);
+        const restored = try self.restore(entity, value);
         if (self.deps.worlds.get(restored.motion.world) == null) return error.CorruptMob;
         _ = try self.insert(restored);
         self.trackingOf(self.slotOf(entity).?).stored = .{ .column = column, .kept = true };
@@ -2015,7 +2112,7 @@ pub const Mobs = struct {
         const here = entities.space.columnOf(state.motion.world, state.motion.position);
         const stored = &self.trackingOf(index).stored;
         if (stored.kept and !std.meta.eql(stored.column, here)) try batch.delete(entities.durable.key(record_prefix, stored.column, state.entity.id));
-        try batch.put(entities.durable.key(record_prefix, here, state.entity.id), &encode(state));
+        try batch.put(entities.durable.key(record_prefix, here, state.entity.id), &encode(state, self.traits(state.entity.species).entity_type));
         stored.* = .{ .column = here, .kept = true };
     }
 
@@ -2064,18 +2161,28 @@ test "mob records round trip" {
         .entity = .{
             .id = 5,
             .uuid = 0x1234,
-            .species = .cow,
+            .species = @fromBackingInt(@intCast(0)),
         },
         .living = .{
             .health = 7.5,
         },
         .rare = .{ .breeding = .{ .in_love = 30, .love_cause = 99 } },
-        .cow = .{
-            .variant = 2,
-        },
+        .kin = .{ .bytes = .{ 2, 0x13, 0, 7 } },
     };
     _ = random.nextInt();
-    const decoded = try Mobs.decode(5, &Mobs.encode(&original));
+    const sheep_type: u32 = @intCast(game_data.registry.entityId("minecraft:sheep").?);
+    var bytes = Mobs.encode(&original, sheep_type);
+    const saved = try Mobs.decode(5, &bytes);
+    try std.testing.expectEqual(sheep_type, saved.entity_type);
+    try std.testing.expectEqual(original.kin, saved.state.kin);
+    // A version 1 record, from when cows were all there was: a cow, its variant the first byte.
+    bytes[0] = 1;
+    // Nothing was written past its random state, which ends at byte 145.
+    @memset(bytes[145..], 0);
+    const old = try Mobs.decode(5, &bytes);
+    try std.testing.expectEqual(Mobs.cow_type, old.entity_type);
+    try std.testing.expectEqual(@as(u8, 2), old.state.kin.bytes[0]);
+    const decoded = saved.state;
     try std.testing.expectEqual(original.motion.position, decoded.motion.position);
     try std.testing.expectEqual(original.living.health, decoded.living.health);
     try std.testing.expectEqual(original.rare.breeding.?.love_cause, decoded.rare.breeding.?.love_cause);
@@ -2101,6 +2208,8 @@ fn mth_floor(value: f64) i32 {
 /// tick keeps, whether its column ticks, and where its record lies in the store.
 const Tracking = struct {
     idling: bool = false,
+    /// The mob's species, which an idle tick reads beside the rest here.
+    species: Species = undefined,
     gaze_yaw: f32 = 0,
     /// Began idling since replication last sent the mob in full, which it does once to catch
     /// anything that changed on the way in; then it sends on the ticks the phase says.
@@ -2121,7 +2230,7 @@ const Row = struct {
     control: mob_state.Control,
     goals: mob_state.Goals,
     navigation: mob_state.Navigation,
-    cow: mob_state.CowPart,
+    kin: mob_state.Kin,
     tracking: Tracking,
     /// The link to the mob's rare parts in `extras`, or none.
     extras: u32,

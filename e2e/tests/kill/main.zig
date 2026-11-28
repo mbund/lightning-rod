@@ -29,7 +29,7 @@ fn spawn(_: *const Players.Player) minecraft.Position {
 const Probe = struct {
     pub const id = "e2e:kill";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, experience: *vanilla.Experience, dropped: *vanilla.ItemEntities, control: *e2e.Control };
+    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, cow: *vanilla.Cow, experience: *vanilla.Experience, dropped: *vanilla.ItemEntities, control: *e2e.Control };
     const Phase = enum { waiting, first, panicking, second, dying, gone, done };
     /// The cow spawns here, six blocks ahead of Alice.
     const start: [3]f64 = .{ 0.5, 65, 6.5 };
@@ -61,7 +61,7 @@ const Probe = struct {
             if (self.phase != .waiting) return error.ReadyTwice;
             try self.give(36, "minecraft:bow", 1);
             try self.give(37, "minecraft:arrow", 2);
-            self.cow = try self.deps.mobs.spawn(.{ .species = .cow, .world = self.deps.players.records[0].world, .position = start, .yaw = 0 });
+            self.cow = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = self.deps.players.records[0].world, .position = start, .yaw = 0 });
             self.phase = .first;
             try self.shoot(handle, partial);
         } else if (std.mem.startsWith(u8, text, "gone ")) {
@@ -112,7 +112,7 @@ const Probe = struct {
             },
             .panicking => {
                 const cow = (try self.deps.mobs.byId(self.cow)) orelse return error.CowGone;
-                if (vanilla.mob_goals.isPanicking(cow)) {
+                if (vanilla.mob_goals.isPanicking(self.deps.mobs, cow)) {
                     self.panicked = true;
                     return;
                 }

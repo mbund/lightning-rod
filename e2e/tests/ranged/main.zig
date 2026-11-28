@@ -28,7 +28,7 @@ fn spawn(_: *const Players.Player) minecraft.Position {
 const Probe = struct {
     pub const id = "e2e:ranged";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, projectiles: *vanilla.Projectiles, control: *e2e.Control };
+    pub const Dependencies = struct { players: *Players, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, mobs: *vanilla.Mobs, cow: *vanilla.Cow, projectiles: *vanilla.Projectiles, control: *e2e.Control };
     const Phase = enum { waiting, aiming, down, landed, done };
     deps: Dependencies,
     phase: Phase = .waiting,
@@ -46,7 +46,7 @@ const Probe = struct {
         if (self.phase != .waiting) return error.ReadyTwice;
         try self.give(36, "minecraft:bow", 1);
         try self.give(37, "minecraft:arrow", 2);
-        self.cow = try self.deps.mobs.spawn(.{ .species = .cow, .world = self.deps.players.records[0].world, .position = .{ 0.5, 65, 6.5 }, .yaw = 0 });
+        self.cow = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = self.deps.players.records[0].world, .position = .{ 0.5, 65, 6.5 }, .yaw = 0 });
         self.phase = .aiming;
         try self.deps.control.send(handle, "aim");
         return .handled;

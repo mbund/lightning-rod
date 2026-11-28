@@ -274,6 +274,19 @@ pub const Entities = struct {
         self.ticker_count += 1;
     }
 
+    /// Another kind for the ticker added with this context, as a plugin learns its kinds one by
+    /// one while the server starts.
+    pub fn addTickerKind(self: *Entities, context: *anyopaque, kind: u32) !void {
+        for (self.tickers[0..self.ticker_count], 0..) |*ticker, index| {
+            if (ticker.context != context) continue;
+            if (self.ticker_of[kind] != no_ticker) return error.KindTickedTwice;
+            self.ticker_of[kind] = @intCast(index);
+            ticker.kinds.bits.set(kind);
+            return;
+        }
+        return error.NoSuchTicker;
+    }
+
     /// ServerLevel's entity tick list, once through: every entity in the order, of whatever
     /// kind, each run of one kind handed to its ticker in turn. Every ticker is made ready first
     /// and done after, one that failed getting ready included, the first failure told once all

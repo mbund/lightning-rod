@@ -206,6 +206,22 @@ pub const MobBlocks = struct {
         return self.shaped[state / 64] >> @intCast(state % 64) & 1 != 0;
     }
 
+    /// The states of the blocks a block tag holds, as a reader of its own keeps them: one each
+    /// in `states`, which is as long as there are states, and none for a tag missing.
+    pub fn statesOfTag(self: *const MobBlocks, name: []const u8, states: []bool) void {
+        std.debug.assert(states.len == self.states.len);
+        @memset(states, false);
+        const block_registry = self.block_definitions.client.get("minecraft:block") orelse return;
+        const tags = &block_registry.tags;
+        const found = tags.find(name) orelse return;
+        for (tags.members(found)) |member| {
+            if (member >= block_registry.entries.len) continue;
+            const block = self.names.get(block_registry.entries[member].name) orelse continue;
+            const info = registry.blocks[block];
+            @memset(states[@intCast(info.min_state) .. @as(usize, @intCast(info.max_state)) + 1], true);
+        }
+    }
+
     /// What does not change with tags: identities, classes, properties and method results.
     fn readFixed(self: *MobBlocks) void {
         for (self.states, 0..) |*entry, index| {

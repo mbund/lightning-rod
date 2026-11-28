@@ -323,13 +323,14 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     checking_tracking = options.check_tracking;
     for (0..options.warm) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     const mobs = simulation.get(vanilla.Mobs);
+    const cow_species = simulation.get(vanilla.Cow).species;
     if (options.cows > 0) {
         // A square field on the flat grass, its middle east of the players at 8, 8 by the offset.
         const side = std.math.sqrt(options.cows - 1) + 1;
         for (0..options.cows) |index| {
             const x = 8.5 + options.cow_offset + options.cow_spacing * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
             const z = 8.5 + options.cow_spacing * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
-            _ = try mobs.spawn(.{ .species = .cow, .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
+            _ = try mobs.spawn(.{ .species = cow_species, .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
             // Between runs of spawns nothing is held: memory makes room for the next.
             if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
         }

@@ -30,7 +30,7 @@ const Scene = struct {
     /// aboard, or a diamond dropped onto it.
     pub const Arrival = enum { nothing, cow, diamond };
     pub const Configuration = struct { arrival: Arrival = .nothing };
-    pub const Dependencies = struct { chunks: *Chunks, worlds: *vanilla.VanillaWorlds, boats: *vanilla.Boats, mobs: *vanilla.Mobs, items: *vanilla.Items, dropped: *vanilla.ItemEntities };
+    pub const Dependencies = struct { chunks: *Chunks, worlds: *vanilla.VanillaWorlds, boats: *vanilla.Boats, mobs: *vanilla.Mobs, cow: *vanilla.Cow, items: *vanilla.Items, dropped: *vanilla.ItemEntities };
 
     deps: Dependencies,
     config: Configuration,
@@ -58,7 +58,7 @@ const Scene = struct {
         self.spawned = true;
         switch (self.config.arrival) {
             .nothing => unreachable,
-            .cow => _ = try self.deps.mobs.spawn(.{ .species = .cow, .world = boat.world, .position = .{ boat.position[0] + 1.0, boat.position[1], boat.position[2] }, .yaw = 90 }),
+            .cow => _ = try self.deps.mobs.spawn(.{ .species = self.deps.cow.species, .world = boat.world, .position = .{ boat.position[0] + 1.0, boat.position[1], boat.position[2] }, .yaw = 90 }),
             // Over the middle of the boat, to fall onto it.
             .diamond => _ = try self.deps.dropped.create(boat.world, .{ boat.position[0], boat.position[1] + 1.5, boat.position[2] }, .{ 0, 0, 0 }, .{ .item = try self.deps.items.define("minecraft:diamond"), .count = 1 }),
         }

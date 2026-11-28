@@ -60,7 +60,7 @@ pub fn test_(mobs: *Mobs, mob: Mob, conditions: Conditions, slot: u32) !bool {
     const dz = mob.motion.position[2] - player.position.z;
     if (dx * dx + dy * dy + dz * dz > reach * reach) return false;
     // Vanilla tests the selector before the range, and both only read, so the cheaper goes first.
-    if (conditions.holding_food and !mobs.holdsFood(slot)) return false;
+    if (conditions.holding_food and !mobs.holdsFood(slot, mob.entity.species)) return false;
     if (conditions.line_of_sight and !try hasLineOfSight(mobs, mob, .{ player.position.x, player.position.y + playerEyeHeight(player.flags.sneaking), player.position.z })) return false;
     return true;
 }
